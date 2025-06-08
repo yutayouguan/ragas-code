@@ -1,263 +1,161 @@
-### 详细总结：基于LangGraph与Ragas构建和评估金属价格查询的ReAct代理
 
-#### 一、网页核心定位与技术栈
-
-**主题**：通过LangGraph构建ReAct代理工作流，结合Ragas评估框架验证代理在工具调用和目标达成上的性能。
-**技术栈**：LangGraph（流程编排）、LangChain（工具集成）、Ragas（评估指标）、OpenAI LLM（gpt-4o-mini）。
-**核心价值**：展示如何通过工具调用扩展LLM能力，并系统化评估代理的任务执行效果。
-
-#### 二、完整技术流程与代码实现
-
-##### **1. 先决条件与环境配置**
-
-###### 1.1 环境要求
-
-- **Python版本**：3.8+
-- **基础认知**：熟悉LangChain工具机制、LangGraph状态图构建、Ragas评估逻辑。
-
-###### 1.2 依赖安装
-
-```python
-# 安装LangGraph（指定版本0.2.44）、Ragas及NLTK
-%pip install langgraph==0.2.44
-%pip install ragas
-%pip install nltk
-```
-
-##### **2. 构建ReAct代理核心组件**
-
-###### 2.1 模拟API响应或初始化真实API
-
-- **方案1：使用预定义JSON模拟金属价格数据**
-
-  ```python
-  metal_price = {
-      "gold": 88.1553, "silver": 1.0523, "platinum": 32.169,
-      "palladium": 35.8252, "copper": 0.0098, "aluminum": 0.0026,
-      # 完整JSON包含更多金属价格（如lbma_gold_am、mcx_silver等，共28个键值对）
-  }
-  ```
-- **方案2：注册metals.dev获取真实API Key（需联网请求）**
-  （代码略，网页建议通过模拟数据快速启动）
-
-###### 2.2 定义工具函数（LangChain工具装饰器）
-
-```python
-from langchain_core.tools import tool
-
-@tool
-def get_metal_price(metal_name: str) -> float:
-    """获取指定金属的当前价格（美元/克）"""
-    metal_name = metal_name.lower().strip()
-    if metal_name not in metal_price:
-        raise KeyError(f"金属'{metal_name}'未找到，可用金属：{', '.join(metal_price.keys())}")
-    return metal_price[metal_name]
-```
-
-- **关键点**：工具接收 `metal_name`参数，返回价格数值，支持异常处理（如金属不存在时抛出错误）。
-
-###### 2.3 绑定工具到LLM（ChatOpenAI模型）
-
-```python
-from langchain_openai import ChatOpenAI
-
-tools = [get_metal_price]  # 工具列表
-llm = ChatOpenAI(model="gpt-4o-mini")  # 初始化LLM
-llm_with_tools = llm.bind_tools(tools)  # 将工具绑定到LLM，允许模型调用工具
-```
-
-###### 2.4 定义对话状态与流程控制
-
-- **状态类（GraphState）**：跟踪对话消息历史
-
-  ```python
-  from langgraph.graph import END
-  from langchain_core.messages import AnyMessage
-  from langgraph.graph.message import add_messages
-  from typing import Annotated
-  from typing_extensions import TypedDict
-
-  class GraphState(TypedDict):
-      messages: Annotated[list[AnyMessage], add_messages]  # 存储HumanMessage/AIMessage/ToolMessage
-  ```
-- **流程控制函数（should_continue）**：判断是否继续工具调用
-
-  ```python
-  def should_continue(state: GraphState):
-      last_message = state["messages"][-1]
-      return "tools" if last_message.tool_calls else END  # 有工具调用则继续，否则结束
-  ```
-
-###### 2.5 定义节点与构建状态图（StateGraph）
-
-- **助手节点（生成LLM响应）**
-
-  ```python
-  def assistant(state: GraphState):
-      response = llm_with_tools.invoke(state["messages"])
-      return {"messages": [response]}  # 返回包含新消息的状态
-  ```
-- **工具节点（管理工具执行）**
-
-  ```python
-  from langgraph.prebuilt import ToolNode
-  tool_node = ToolNode(tools)  # 初始化工具节点，传入get_metal_price工具
-  ```
-- **构建完整状态图**
-
-  ```python
-  from langgraph.graph import START, StateGraph
-  from IPython.display import Image, display
-
-  builder = StateGraph(GraphState)  # 基于GraphState构建图
-
-  # 添加节点
-  builder.add_node("assistant", assistant)
-  builder.add_node("tools", tool_node)
-
-  # 定义边（流程走向）
-  builder.add_edge(START, "assistant")  # 起始于助手节点
-  builder.add_conditional_edges("assistant", should_continue, ["tools", END])  # 助手节点根据条件转向工具节点或结束
-  builder.add_edge("tools", "assistant")  # 工具调用后回到助手节点处理结果
-
-  react_graph = builder.compile()  # 编译状态图
-  display(Image(react_graph.get_graph(xray=True).draw_mermaid_png()))  # 可视化图结构（生成流程图）
-  ```
-
-##### **3. 代理执行与消息格式转换**
-
-###### 3.1 运行代理并获取对话历史
-
-```python
-from langchain_core.messages import HumanMessage
-
-# 示例查询：铜价
-messages = [HumanMessage(content="What is the price of copper?")]
-result = react_graph.invoke({"messages": messages})  # 执行状态图
-
-# 输出对话历史（包含HumanMessage、AIMessage、ToolMessage）
-print(result["messages"])
-```
-
-###### 3.2 转换为Ragas评估格式
-
-```python
-from ragas.integrations.langgraph import convert_to_ragas_messages
-
-ragas_trace = convert_to_ragas_messages(result["messages"])  # 转换为Ragas消息列表
-# 输出格式：包含type（human/ai/tool）、content、tool_calls的结构化数据
-```
-
-- **转换后示例**：
-  ```python
-  [
-      HumanMessage(type='human', content='What is the price of copper?'),
-      AIMessage(type='ai', content='', tool_calls=[ToolCall(name='get_metal_price', args={'metal_name': 'copper'})]),
-      ToolMessage(type='tool', content='0.0098'),
-      AIMessage(type='ai', content='The price of copper is $0.0098 per gram.')
-  ]
-  ```
-
-##### **4. 代理性能评估（Ragas指标）**
-
-###### 4.1 工具调用准确性（Tool Call Accuracy）
-
-- **目标**：验证LLM是否正确调用工具及参数
-- **代码实现**：
-  ```python
-  from ragas.metrics import ToolCallAccuracy
-  from ragas.dataset_schema import MultiTurnSample
-  from ragas.messages import ToolCall
-
-  # 创建评估样本（指定预期工具调用）
-  sample = MultiTurnSample(
-      user_input=ragas_trace,  # 转换后的Ragas消息列表
-      reference_tool_calls=[ToolCall(name="get_metal_price", args={"metal_name": "copper"})]
-  )
-
-  # 计算得分（1.0表示完全正确）
-  tool_accuracy_scorer = ToolCallAccuracy()
-  score = await tool_accuracy_scorer.multi_turn_ascore(sample)
-  print(f"Tool Call Accuracy: {score}")  # 输出：1.0
-  ```
-
-###### 4.2 代理目标准确性（Agent Goal Accuracy）
-
-- **目标**：验证代理是否达成用户最终目标（如计算10克银价）
-- **代码实现**（以复杂查询为例）：
-  ```python
-  from ragas.metrics import AgentGoalAccuracyWithReference
-  from ragas.llms import LangchainLLMWrapper
-
-  # 新查询：10克银价
-  messages = [HumanMessage(content="What is the price of 10 grams of silver?")]
-  result = react_graph.invoke({"messages": messages})
-  ragas_trace = convert_to_ragas_messages(result["messages"])
-
-  # 创建样本（指定目标描述）
-  sample = MultiTurnSample(
-      user_input=ragas_trace,
-      reference="Price of 10 grams of silver"  # 预期目标
-  )
-
-  # 初始化评估LLM并计算得分
-  evaluator_llm = LangchainLLMWrapper(ChatOpenAI(model="gpt-4o-mini"))
-  scorer = AgentGoalAccuracyWithReference()
-  scorer.llm = evaluator_llm
-  score = await scorer.multi_turn_ascore(sample)
-  print(f"Agent Goal Accuracy: {score}")  # 输出：1.0（目标达成）
-  ```
-
-##### **5. 完整代码逻辑图示**
-
-```mermaid
-graph TD
-    A[用户输入] --> B[助手节点（LLM生成响应）]
-    B -->|包含工具调用| C[工具节点（执行get_metal_price）]
-    C --> D[助手节点（处理工具返回结果）]
-    D -->|无工具调用| E[结束]
-    B -->|无工具调用| E
-```
-
-#### 三、关键技术细节解析
-
-1. **ReAct代理核心机制**：
-
-   - **推理-行动循环**：LLM先决定是否调用工具（推理），再通过工具节点执行操作（行动），重复直至无需工具调用。
-   - **状态传递**：`GraphState`通过 `messages`列表存储完整对话历史，确保节点间信息共享（如工具返回值传递给LLM生成最终响应）。
-2. **Ragas评估优势**：
-
-   - **多轮对话支持**：`MultiTurnSample`适配复杂对话流程，支持逐轮验证工具调用和目标达成。
-   - **指标灵活性**：除内置指标外，支持自定义评估逻辑（如 `ToolCallAccuracy`可扩展参数校验规则）。
-3. **LangGraph核心价值**：
-
-   - **可视化流程编排**：通过 `StateGraph`构建器直观定义节点连接，降低复杂代理的开发难度。
-   - **条件控制**：`should_continue`函数实现动态流程决策，避免硬编码状态转移逻辑。
-
-#### 四、代码扩展与最佳实践
-
-1. **真实API集成**：修改 `get_metal_price`函数，使用 `requests`库调用metals.dev真实API（需处理身份验证和错误重试）：
-
-   ```python
-   import requests
-   API_KEY = "your_api_key"
-   def get_metal_price(metal_name: str) -> float:
-       url = f"https://metals.dev/api/{metal_name}/price"
-       headers = {"Authorization": f"Bearer {API_KEY}"}
-       response = requests.get(url, headers=headers)
-       response.raise_for_status()
-       return response.json()["price"]
-   ```
-2. **异常处理增强**：在工具函数中添加更细致的错误处理（如网络错误、API返回格式异常），提升代理鲁棒性。
-3. **多工具扩展**：
-   添加更多工具（如 `get_metal_trend`分析价格趋势），并在状态图中增加对应节点和流程控制。
-
-#### 五、总结
-
-本教程完整演示了从代理构建到评估的全流程：
-
-1. **LangGraph**负责定义对话流程和工具调用逻辑，通过状态图实现可视化编排；
-2. **Ragas**提供专业评估指标，确保代理在工具使用和用户目标上的准确性；
-3. **代码细节**覆盖了从环境配置到复杂指标计算的每个环节，可直接复用于其他工具调用场景（如天气查询、电商导购）。
-
-通过这种集成，开发者能高效构建可解释、可验证的AI代理，尤其适合需要外部数据交互的业务场景（金融、客服、实时数据查询等）。
+### 详细总结：Dria-Agent-α框架与Pythonic函数调用技术（含完整代码示例）
+
+
+#### **一、核心目标与创新点**  
+传统大语言模型（LLM）通过JSON模式调用工具时需多轮交互且逻辑受限。**Dria-Agent-α**提出**Pythonic Function Calling**框架，让LLM直接输出Python代码实现工具调用，核心优势：  
+1. **利用LLM的程序知识**：LLM预训练数据含大量Python代码，支持复杂过程化推理（如条件判断、变量传递）。  
+2. **一站式复杂逻辑处理**：通过Python代码在单次对话内完成多步操作，避免JSON模式的多轮交互瓶颈。  
+3. **语法自然性**：Python接近伪代码，降低LLM生成门槛，兼容其代码生成能力。
+
+
+#### **二、Pythonic函数调用：核心机制与代码示例**  
+##### **1. 示例：多步工具调用的Python实现**  
+**用户需求**：  
+*“检查明天10:00-12:00是否可用，若可用则预约与论文导师的会议，并添加提醒。”*  
+
+**可用工具函数定义**（Python）：  
+```python  
+def check_availability(day: str, start_time: str, end_time: str) -> bool:  
+    """检查时间槽可用性"""  
+    pass  
+
+def make_appointment(day: str, start_time: str, end_time: str, title: str) -> dict:  
+    """预约会议，返回预约详情"""  
+    pass  
+
+def add_to_reminders(reminder_text: str) -> bool:  
+    """添加提醒"""  
+    pass  
+```  
+
+**Pythonic函数调用代码（单次生成）**：  
+```python  
+from datetime import datetime, timedelta  
+today = datetime.now()  
+tomorrow = (today + timedelta(days=1)).strftime("%Y-%m-%d")  # 计算明天日期  
+start_time, end_time = "10:00", "12:00"  
+
+is_available = check_availability(tomorrow, start_time, end_time)  # 检查可用性  
+appointment_result = (  
+    make_appointment(  
+        day=tomorrow,  
+        start_time=start_time,  
+        end_time=end_time,  
+        title="Meeting with Thesis Supervisor"  
+    )  
+    if is_available else {"appointment_made": False}  # 条件预约  
+)  
+
+if appointment_result["appointment_made"]:  # 条件添加提醒  
+    add_to_reminders("Meeting with Thesis Supervisor scheduled for 10:00 AM tomorrow")  
+```  
+
+**对比传统JSON方法**：需多轮对话（先调用`check_availability`，根据结果调用`make_appointment`，再根据预约结果调用`add_to_reminders`），而Pythonic方法通过代码逻辑一次性完成。
+
+
+##### **2. 代码执行与结构化输出**  
+使用`exec-python`执行生成的代码，跟踪函数调用、变量状态及错误，输出结构化结果。  
+**示例代码**：  
+```python  
+x = [1, 2]  
+y = [2, 3]  
+z = pair_sum(x, y)  # 假设pair_sum为自定义函数，计算元素和  
+k = pair_sum(z, z)  
+```  
+
+**执行输出**：  
+```json  
+{  
+  "function_results": {"pair_sum": ["z", "k"]},  # 记录被调用的函数及结果变量  
+  "variables": {  
+    "x": [1, 2],  
+    "y": [2, 3],  
+    "z": [3, 5],  # pair_sum(x,y)结果  
+    "k": [6, 10]  # pair_sum(z,z)结果  
+  },  
+  "errors": []  # 无错误  
+}  
+```  
+该结构支持LLM在多轮对话中复用历史变量（如`z`、`k`），实现状态依赖推理。
+
+
+#### **三、数据生成：合成数据结构与代码示例**  
+##### **1. 训练数据组件（Sample Entry）**  
+**数据格式**（JSON）：  
+```json  
+{  
+  "difficulty": "hard",  
+  "function_schema_python": "def check_user_permissions(...):\n    pass\n...",  # Python函数定义  
+  "function_schema_json": [...],  # JSON函数模式（传统工具调用格式）  
+  "mock_functions": "def check_user_permissions(...):\n    # 模拟真实逻辑\n    if username == 'alex': return {...}\n...",  # 带逻辑的模拟函数  
+  "user_query": "修改Alex对\\\\server\\shared\\documents的读写权限",  
+  "checklist": {"functions": ["check_user_permissions", "modify_folder_permissions"], "values": [...]}  # 验证清单  
+}  
+```  
+
+**完整Python函数定义（示例）**：  
+```python  
+def check_user_permissions(username: str, folder_path: str) -> dict:  
+    """检查用户对文件夹的权限"""  
+    if not username or not folder_path:  
+        raise ValueError("用户名或文件夹路径无效")  
+    if username.lower() == "alex" and folder_path == "\\\\server\\\\shared\\\\documents":  
+        return {  
+            "read": False,  
+            "write": False,  
+            "execute": False,  
+            "owner": "Administrator"  
+        }  
+    return {  
+        "read": True,  
+        "write": True,  
+        "execute": True,  
+        "owner": "Administrator"  
+    }  
+
+def modify_folder_permissions(username: str, folder_path: str, permissions: dict) -> bool:  
+    """修改用户权限"""  
+    if not all(key in permissions for key in ["read", "write", "execute"]):  
+        raise ValueError("权限字典需包含read/write/execute")  
+    if username.lower() == "alex" and folder_path == "\\\\server\\\\shared\\\\documents":  
+        return True  # 模拟修改成功  
+    return False  
+```  
+
+
+##### **2. 数据验证：执行反馈循环**  
+通过代码执行验证生成的解决方案，保留符合预期的条目（checklist得分>0.75）。  
+**验证逻辑伪代码**：  
+```python  
+def validate_solution(solution_code, mock_functions):  
+    try:  
+        exec(mock_functions + solution_code)  # 注入模拟函数后执行代码  
+        # 检查是否调用了预期函数（如check_user_permissions）  
+        # 对比输出结果与checklist中的预期值  
+        return checklist_score  # 0-1分  
+    except Exception as e:  
+        return 0.0  # 语法或逻辑错误则得分0  
+```  
+
+
+#### **四、模型与技术细节**  
+- **训练数据规模**：通过分布式系统Dria生成跨领域数据（如日历、文件权限、API调用），每个条目包含完整Python工具链逻辑。  
+- **模型架构**：基于Qwen2.5-Coder-3B/7B-Instruct，微调后支持生成符合Python语法的工具调用代码，避免JSON模式的严格格式限制。  
+- **开源资源**：模型[Dria-Agent-α-3B](链接)和[Dria-Agent-α-7B](链接)发布于Hugging Face，附带合成数据生成工具（计划2025年2月开源）。
+
+
+#### **五、未来工作与技术延伸**  
+1. **强化学习与执行反馈**（RLEF）：  
+   - 通过代码执行结果（如成功/失败、变量状态）构建奖励信号，微调模型以优化复杂逻辑生成（如循环、异常处理）。  
+2. **数学推理优化**（rStar-Math）：  
+   - 扩展Pythonic框架支持符号计算与数学推导，例如生成求解方程的代码并验证中间步骤。  
+
+
+#### **六、核心价值与代码意义**  
+Dria-Agent-α的Pythonic函数调用通过保留完整代码逻辑，实现了：  
+1. **逻辑透明性**：代码可直接解读LLM的决策流程（如条件分支、变量依赖）。  
+2. **工具兼容性**：无缝对接现有Python工具库（如`datetime`、文件操作库），降低开发者集成成本。  
+3. **错误可追溯性**：通过代码执行日志定位问题（如参数错误、函数未定义），优于JSON模式的黑箱交互。  
+
+该框架为AI代理开发提供了“自然语言→Python代码→工具执行”的端到端方案，尤其适合需要复杂逻辑编排的场景（如自动化办公、编程辅助、数据分析）。
